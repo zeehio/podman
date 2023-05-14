@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,8 +31,8 @@ import (
 	"github.com/containers/storage/pkg/idtools"
 	stypes "github.com/containers/storage/types"
 	securejoin "github.com/cyphar/filepath-securejoin"
-	"github.com/opencontainers/runtime-spec/specs-go"
 	ruser "github.com/opencontainers/runc/libcontainer/user"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
 )
@@ -294,18 +295,17 @@ func GetNoMapMapping() (*stypes.IDMappingOptions, int, int, error) {
 	return &options, 0, 0, nil
 }
 
-
 func mapIDwithMapping(id uint64, mapping []ruser.IDMap, mapSetting string) (mappedid uint64, err error) {
 	for _, v := range mapping {
-	    if v.Count == 0 {
-	        continue
-	    }
-	    if id >= uint64(v.ParentID) && id < uint64(v.ParentID + v.Count) {
-	        offset := id - uint64(v.ParentID)
-	        return uint64(v.ID) + offset, nil;
-	    }
+		if v.Count == 0 {
+			continue
+		}
+		if id >= uint64(v.ParentID) && id < uint64(v.ParentID+v.Count) {
+			offset := id - uint64(v.ParentID)
+			return uint64(v.ID) + offset, nil
+		}
 	}
-	return uint64(0), fmt.Errorf("Parent ID %s %d is not mapped/delegated.", mapSetting, id)
+	return uint64(0), fmt.Errorf("parent ID %s %d is not mapped/delegated", mapSetting, id)
 }
 
 // Extension of idTools.parseTriple that parses idmap triples from string.
@@ -313,11 +313,21 @@ func mapIDwithMapping(id uint64, mapping []ruser.IDMap, mapSetting string) (mapp
 // means "take the 1001 id from the parent namespace and map it to 101001"
 // See https://github.com/containers/podman/issues/18333 for details
 func parseTriple(spec []string, parentMapping []ruser.IDMap, mapSetting string) (container, host, size uint32, err error) {
-	cid, err := strconv.ParseUint(spec[0], 10, 32)
+	if len(spec[0]) == 0 {
+		return 0, 0, 0, fmt.Errorf("invalid empty container id at %s map: %v", mapSetting, spec)
+	}
+	var cid, hid uint64
+	if spec[0][0] == '+' {
+		cid, err = strconv.ParseUint(spec[0][1:], 10, 32)
+	} else {
+		cid, err = strconv.ParseUint(spec[0], 10, 32)
+	}
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("parsing id map value %q: %w", spec[0], err)
 	}
-	hid := uint64(0)
+	if len(spec[1]) == 0 {
+		return 0, 0, 0, fmt.Errorf("invalid empty host id at %s map: %v", mapSetting, spec)
+	}
 	if spec[1][0] != '@' {
 		hid, err = strconv.ParseUint(spec[1], 10, 32)
 	} else {
@@ -340,12 +350,125 @@ func parseTriple(spec []string, parentMapping []ruser.IDMap, mapSetting string) 
 	return uint32(cid), uint32(hid), uint32(sz), nil
 }
 
+func distUntilMappedCid(cid int, idmap []idtools.IDMap) int {
+	for _, v := range idmap {
+		if cid < v.ContainerID {
+			return v.ContainerID - cid
+		}
+		if cid < v.ContainerID+v.Size {
+			return 0
+		}
+	}
+	return math.MaxInt32
+}
+
+func distUntilUnmappedHid(hid int, idmap []idtools.IDMap) int {
+	for _, v := range idmap {
+		if hid < v.HostID {
+			return 0
+		}
+		if hid < (v.HostID + v.Size) {
+			return v.HostID + v.Size - hid
+		}
+	}
+	return 0
+}
+
+func distUntilMappedHid(hid int, idmap []idtools.IDMap) int {
+	for _, v := range idmap {
+		if hid < v.HostID {
+			return v.HostID - hid
+		}
+		if hid < v.HostID+v.Size {
+			return 0
+		}
+	}
+	return math.MaxInt32
+}
+
+func getIdmapForCid(cid int, idmap []idtools.IDMap) (result idtools.IDMap, err error) {
+	for _, v := range idmap {
+		if cid == v.ContainerID {
+			return v, nil
+		}
+	}
+	return idtools.IDMap{ContainerID: 0, HostID: 0, Size: 0}, fmt.Errorf("could not find cid starting at: %d in mapping %v", cid, idmap)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// This function takes an existing mapping array, and breaks and inserts a mapping
+// into it.
+func breakInsert(idmap []idtools.IDMap, totalIds int) (result []idtools.IDMap, err error) {
+	// Criteria: Any mapping we create here is good as long as it:
+	// 1. Preserves the maps already given at idmap
+	// 2. Maps the rest of the space
+
+	// Trivial case
+	if len(idmap) == 0 {
+		return idmap, nil
+	}
+
+	idmapByCid := append([]idtools.IDMap{}, idmap...)
+	sort.Slice(idmapByCid, func(i, j int) bool {
+		return idmapByCid[i].ContainerID < idmapByCid[j].ContainerID
+	})
+	idmapByHid := append([]idtools.IDMap{}, idmap...)
+	sort.Slice(idmapByHid, func(i, j int) bool {
+		return idmapByHid[i].HostID < idmapByHid[j].HostID
+	})
+	cid := int(0)
+	hid := int(0)
+	availIds := totalIds - mapTotalCount2(idmap)
+	for availIds > 0 {
+		cidsUntilMapped := distUntilMappedCid(cid, idmapByCid)
+		if cidsUntilMapped == 0 {
+			toAppend, err := getIdmapForCid(cid, idmapByCid)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, toAppend)
+			cid += toAppend.Size
+		} else {
+			// Skip any mapped hids:
+			hid += distUntilUnmappedHid(hid, idmapByHid)
+			// Determine the size of the next idmap:
+			hidsUntilMapped := distUntilMappedHid(hid, idmapByHid)
+			size := min(cidsUntilMapped, hidsUntilMapped)
+			if size > availIds {
+				size = availIds
+			}
+			result = append(result, idtools.IDMap{
+				ContainerID: cid,
+				HostID:      hid,
+				Size:        size,
+			})
+			cid += size
+			hid += size
+			availIds -= size
+		}
+	}
+	// Map any missing blocks beyond cid
+	for _, v := range idmapByCid {
+		if v.ContainerID >= cid {
+			result = append(result, v)
+		}
+	}
+	return result, nil
+}
+
 // Extension of idTools.ParseIDMap that parses idmap triples from string.
 // This extension covers the "@" syntax: The "101001:@1001:1" mapping
 // means "take the 1001 id from the parent namespace and map it to 101001"
 // See https://github.com/containers/podman/issues/18333 for details
 func ParseIDMap(mapSpec []string, mapSetting string, parentMapping []ruser.IDMap) (idmap []idtools.IDMap, err error) {
-	stdErr := fmt.Errorf("aaa initializing ID mappings: %s setting is malformed expected [\"uint32:[@]uint32:uint32\"] : %q", mapSetting, mapSpec)
+	stdErr := fmt.Errorf("initializing ID mappings: %s setting is malformed expected [\"[+]uint32:[@]uint32:uint32\"] : %q", mapSetting, mapSpec)
+	breakInsertMode := false
 	for _, idMapSpec := range mapSpec {
 		if idMapSpec == "" {
 			continue
@@ -358,7 +481,18 @@ func ParseIDMap(mapSpec []string, mapSetting string, parentMapping []ruser.IDMap
 			if i%3 != 0 {
 				continue
 			}
-			cid, hid, size, err := parseTriple(idSpec[i : i+3], parentMapping, mapSetting)
+			if len(idSpec[i]) == 0 {
+				return nil, stdErr
+			}
+
+			if idSpec[i][0] == '+' {
+				if i == 0 {
+					breakInsertMode = true
+				} else if !breakInsertMode {
+					return nil, fmt.Errorf("initializing ID mappings: Either all %s mappings start with '+' or none of them do", mapSetting)
+				}
+			}
+			cid, hid, size, err := parseTriple(idSpec[i:i+3], parentMapping, mapSetting)
 			if err != nil {
 				return nil, err
 			}
@@ -374,9 +508,29 @@ func ParseIDMap(mapSpec []string, mapSetting string, parentMapping []ruser.IDMap
 			idmap = append(idmap, mapping)
 		}
 	}
+	if breakInsertMode {
+		idmap, err = breakInsert(idmap, int(MapTotalCount(parentMapping)))
+		if err != nil {
+			return nil, err
+		}
+	}
 	return idmap, nil
 }
 
+func mapTotalCount2(mapping []idtools.IDMap) int {
+	out := int(0)
+	for _, v := range mapping {
+		out += v.Size
+	}
+	return out
+}
+func MapTotalCount(mapping []ruser.IDMap) int64 {
+	out := int64(0)
+	for _, v := range mapping {
+		out += v.Count
+	}
+	return out
+}
 
 // ParseIDMapping takes idmappings and subuid and subgid maps and returns a storage mapping
 func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []string, subUIDMap, subGIDMap string) (*stypes.IDMappingOptions, error) {
@@ -403,6 +557,14 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		return &options, nil
 	}
 
+	/* The parent mappings may be nil if not available.
+	 * We handle nil gracefully already
+	 */
+	parentUIDMap, parentGIDMap, _ := rootless.GetAvailableIDMaps()
+
+	totaluidmaps := MapTotalCount(parentUIDMap)
+	totalgidmaps := MapTotalCount(parentGIDMap)
+
 	if subGIDMap == "" && subUIDMap != "" {
 		subGIDMap = subUIDMap
 	}
@@ -410,10 +572,18 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		subUIDMap = subGIDMap
 	}
 	if len(gidMapSlice) == 0 && len(uidMapSlice) != 0 {
-		gidMapSlice = uidMapSlice
+		if uidMapSlice[0][0] == '+' {
+			gidMapSlice = []string{fmt.Sprintf("0:0:%d", totalgidmaps)}
+		} else {
+			gidMapSlice = uidMapSlice
+		}
 	}
 	if len(uidMapSlice) == 0 && len(gidMapSlice) != 0 {
-		uidMapSlice = gidMapSlice
+		if gidMapSlice[0][0] == '+' {
+			uidMapSlice = []string{fmt.Sprintf("0:0:%d", totaluidmaps)}
+		} else {
+			uidMapSlice = gidMapSlice
+		}
 	}
 
 	if subUIDMap != "" && subGIDMap != "" {
@@ -424,11 +594,12 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		options.UIDMap = mappings.UIDs()
 		options.GIDMap = mappings.GIDs()
 	}
-	parsedUIDMap, err := idtools.ParseIDMap(uidMapSlice, "UID")
+
+	parsedUIDMap, err := ParseIDMap(uidMapSlice, "UID", parentUIDMap)
 	if err != nil {
 		return nil, err
 	}
-	parsedGIDMap, err := idtools.ParseIDMap(gidMapSlice, "GID")
+	parsedGIDMap, err := ParseIDMap(gidMapSlice, "GID", parentGIDMap)
 	if err != nil {
 		return nil, err
 	}

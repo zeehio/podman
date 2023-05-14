@@ -17,6 +17,7 @@ import (
 	"github.com/containers/podman/v4/pkg/domain/entities"
 	"github.com/containers/podman/v4/pkg/namespaces"
 	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v4/pkg/util"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/types"
 	"github.com/sirupsen/logrus"
@@ -302,6 +303,14 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		return &options, nil
 	}
 
+	/* The parent mappings may be nil if not available.
+	 * We handle nil gracefully already
+	 */
+	parentUIDMap, parentGIDMap, _ := rootless.GetAvailableIDMaps()
+
+	totaluidmaps := util.MapTotalCount(parentUIDMap)
+	totalgidmaps := util.MapTotalCount(parentGIDMap)
+
 	if subGIDMap == "" && subUIDMap != "" {
 		subGIDMap = subUIDMap
 	}
@@ -309,10 +318,22 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		subUIDMap = subGIDMap
 	}
 	if len(gidMapSlice) == 0 && len(uidMapSlice) != 0 {
-		gidMapSlice = uidMapSlice
+		if uidMapSlice[0][0] == '+' {
+			// We want to extend a gidmap, the uidmap should not change,
+			// So we map the identity:
+			gidMapSlice = []string{fmt.Sprintf("0:0:%d", totalgidmaps)}
+		} else {
+			gidMapSlice = uidMapSlice
+		}
 	}
 	if len(uidMapSlice) == 0 && len(gidMapSlice) != 0 {
-		uidMapSlice = gidMapSlice
+		if gidMapSlice[0][0] == '+' {
+			// We want to extend a uidmap, the gidmap should not change,
+			// So we map the identity
+			uidMapSlice = []string{fmt.Sprintf("0:0:%d", totaluidmaps)}
+		} else {
+			uidMapSlice = gidMapSlice
+		}
 	}
 	if len(uidMapSlice) == 0 && subUIDMap == "" && os.Getuid() != 0 {
 		uidMapSlice = []string{fmt.Sprintf("0:%d:1", os.Getuid())}
@@ -329,11 +350,12 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		options.UIDMap = mappings.UIDs()
 		options.GIDMap = mappings.GIDs()
 	}
-	parsedUIDMap, err := idtools.ParseIDMap(uidMapSlice, "UID")
+
+	parsedUIDMap, err := util.ParseIDMap(uidMapSlice, "UID", parentUIDMap)
 	if err != nil {
 		return nil, err
 	}
-	parsedGIDMap, err := idtools.ParseIDMap(gidMapSlice, "GID")
+	parsedGIDMap, err := util.ParseIDMap(gidMapSlice, "GID", parentGIDMap)
 	if err != nil {
 		return nil, err
 	}
