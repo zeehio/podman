@@ -76,9 +76,24 @@ Every additional range is added sequentially afterward:
 | 1                     | $FIRST_RANGE_ID        | $FIRST_RANGE_LENGTH |
 | 1+$FIRST_RANGE_LENGTH | $SECOND_RANGE_ID       | $SECOND_RANGE_LENGTH|
 
-By default providing **--uidmap** or **-gidmap** replaces the whole mapping.
-If only one of those two are given, by default the other one is copied,
-so if you want to change only one of the two, you should provide both.
+By default, providing either **--uidmap** or **--gidmap** replaces the
+whole mapping. If only one of those two options is given, the other one is
+copied by default.  If only one value of the two needs to be changed,
+both values should be provided.
+
+At times it may be desired that a specific host group needs to be mapped
+that has already been subordinated within_/etc/subgid without specifying
+the rest of the mapping when running as rootless. This can be done by
+passing **--gidmap=+*container_gid*:*@host_gid*:1**. This uses the *+* sign
+to extend the default mapping and not replace it. It also uses the
+*@* sign to specify that the mapping refers to the host namespace, the parent
+of the intermediate namespace. For instance, If the user belongs to the group
+1002 and that group is subordinated to that user with
+`usermod --add-subgids 1002-1002 $USER`, that group can be mapped into the
+container with: **--gidmap=+10000:@1002:1**. If this mapping is combined with
+the option, **--group-add=keep-groups**, the user in the container will belong
+to group 10000, and files belonging to group 1002 in the host will appear as
+being owned by group 10000 inside the container.
 
 Even if a user does not have any subordinate UIDs in  _/etc/subuid_,
 **--uidmap** can be used to map the normal UID of the user to a
