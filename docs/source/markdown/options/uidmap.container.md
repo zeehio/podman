@@ -76,6 +76,10 @@ Every additional range is added sequentially afterward:
 | 1                     | $FIRST_RANGE_ID        | $FIRST_RANGE_LENGTH |
 | 1+$FIRST_RANGE_LENGTH | $SECOND_RANGE_ID       | $SECOND_RANGE_LENGTH|
 
+By default providing **--uidmap** or **-gidmap** replaces the whole mapping.
+If only one of those two are given, by default the other one is copied,
+so if you want to change only one of the two, you should provide both.
+
 Even if a user does not have any subordinate UIDs in  _/etc/subuid_,
 **--uidmap** can be used to map the normal UID of the user to a
 container UID by running `podman <<subcommand>> --uidmap $container_uid:0:1 --user $container_uid ...`.
