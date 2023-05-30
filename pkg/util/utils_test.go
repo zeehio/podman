@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containers/storage/pkg/idtools"
+	ruser "github.com/opencontainers/runc/libcontainer/user"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 )
@@ -12,6 +14,78 @@ import (
 var (
 	sliceData = []string{"one", "two", "three", "four"}
 )
+
+var BreakInsert = breakInsert
+
+func TestMapTotalCount(t *testing.T) {
+	idmap := []ruser.IDMap{
+		{
+			ID:       100000,
+			ParentID: 1000,
+			Count:    1,
+		},
+		{
+			ID:       100001,
+			ParentID: 1001,
+			Count:    30,
+		},
+	}
+	expectedResult := int64(31)
+	result := MapTotalCount(idmap)
+	assert.Equal(t, result, expectedResult)
+}
+
+func TestParseIDMap(t *testing.T) {
+	mapSpec := []string{"+100000:@1002:1"}
+
+	parentMapping := []ruser.IDMap{
+		{
+			ID:       int64(20),
+			ParentID: int64(1002),
+			Count:    1,
+		},
+	}
+	expectedResult := []idtools.IDMap{
+		{
+			ContainerID: 100000,
+			HostID:      20,
+			Size:        1,
+		},
+	}
+	result, err := ParseIDMap(
+		mapSpec,
+		"UID",
+		parentMapping,
+	)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, result, expectedResult)
+}
+
+func TestBreakInsert(t *testing.T) {
+	idmap := []idtools.IDMap{
+		{
+			ContainerID: 101002,
+			HostID:      1002,
+			Size:        1,
+		},
+	}
+	expectedResult := []idtools.IDMap{
+		{
+			ContainerID: 0,
+			HostID:      0,
+			Size:        9,
+		},
+		{
+			ContainerID: 101002,
+			HostID:      1002,
+			Size:        1,
+		},
+	}
+	totalIds := int(10)
+	result, err := BreakInsert(idmap, totalIds)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, result, expectedResult)
+}
 
 func TestStringInSlice(t *testing.T) {
 	// string is in the slice
