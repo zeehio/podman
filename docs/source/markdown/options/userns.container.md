@@ -7,6 +7,7 @@
 Set the user namespace mode for the container.
 
 If `--userns` is not set, the default value is determined as follows.
+
 - If `--pod` is set, `--userns` is ignored and the user namespace of the pod is used.
 - If the environment variable **PODMAN_USERNS** is set its value is used.
 - If `userns` is specified in `containers.conf` this value is used.
